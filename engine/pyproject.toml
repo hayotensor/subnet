@@ -1,0 +1,36 @@
+[project]
+name = "subnet-engine"
+version = "0.1.0"
+requires-python = ">=3.10, <4.0"
+description = "Core engine and coordination protocol"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "trio",
+    "msgpack",
+]
+
+[project.optional-dependencies]
+dev = [
+    "wheel",
+    "setuptools>=42",
+    "ruff>=0.11.10",
+]
+
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["subnet_engine"]
+
+[tool.setuptools.package-data]
+subnet_engine = ["py.typed"]
