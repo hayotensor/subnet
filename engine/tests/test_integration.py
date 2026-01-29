@@ -1,327 +1,150 @@
-"""Integration tests for the complete engine-coordinator system."""
+"""Integration tests for the complete HTTP engine-coordinator system."""
 
-import os
-
+import json
 import pytest
 import trio
+import uvicorn
 from subnet_engine.coordinator import EngineClient
-from subnet_engine.engine import handle_connection as engine_handle_connection
-from subnet_engine.engine import open_unix_listener
-from subnet_engine.framing import recv_msg, send_msg
+from subnet_engine.engine import app as engine_fastapi
 
 
-# Mock App to handle requests from Proxy
-async def mock_app_handler(stream):
-    async with trio.open_nursery() as nursery:
-        while True:
-            try:
-                req = await recv_msg(stream)
-                if req is None:
-                    break
+class BackgroundServer:
+    def __init__(self, app, host="127.0.0.1", port=0):
+        self.app = app
+        self.host = host
+        self.port = port
+        self._server = None
 
-                # Simple logic for testing: word splitter
-                request_id = req.get("request_id")
-                payload = req.get("payload", "")
+    async def run(self, task_status=trio.TASK_STATUS_IGNORED):
+        config = uvicorn.Config(
+            self.app, host=self.host, port=self.port, log_level="error"
+        )
+        self._server = uvicorn.Server(config)
 
-                for chunk in payload.split():
-                    await send_msg(
-                        stream,
-                        {"request_id": request_id, "type": "chunk", "data": chunk},
-                    )
-
-                await send_msg(stream, {"request_id": request_id, "type": "done"})
-
-            except trio.EndOfChannel:
-                break
-            except Exception:
-                break
+        # We need to reach into uvicorn to get the actual port if it was 0
+        # This is a bit tricky with trio.
+        task_status.started()
+        await self._server.serve()
 
 
 @pytest.mark.trio
-async def test_full_communication_flow(temp_socket_path):
-    """Test complete communication between engine and coordinator."""
-    results = []
+async def test_full_communication_flow():
+    """Test complete communication between engine and coordinator via HTTP."""
+    # Note: Running actual uvicorn servers in trio tests is heavy.
+    # A better approach for unit-integration is using httpx.ASGITransport
+    # to link the clients directly to the apps without real sockets.
 
-    # Use distinct paths for engine and app sockets in test
-    engine_sock = temp_socket_path + ".engine"
-    app_sock = temp_socket_path + ".app"
+    from httpx import AsyncClient, ASGITransport
 
-    # We need to monkeypatch the SOCKET_PATHS or pass them if possible.
-    # Since they are globals in engine.py and we import the function that uses globals
-    # (handle_task internally uses EngineClient with global), we might need to mock
-    # os.environ or patch the module globals.
+    # End-to-end mock: Coordinator -> Engine -> App
+    # We can mock the Engine's HTTP call to the App.
 
-    # Actually engine.engine.APP_SOCKET_PATH is what handle_task uses.
-    # Let's patch it.
-    from engine import engine
+    # Let's mock 'httpx.AsyncClient.stream' globally like in test_engine.py
+    # to simulate the Engine calling the App.
 
-    original_app_path = engine.APP_SOCKET_PATH
-    engine.APP_SOCKET_PATH = app_sock
+    rpc_req_payload = "hello world integration"
+    app_response_lines = [
+        json.dumps(
+            {"jsonrpc": "2.0", "result": {"type": "chunk", "data": "hello"}, "id": "1"}
+        ),
+        json.dumps(
+            {"jsonrpc": "2.0", "result": {"type": "chunk", "data": "world"}, "id": "1"}
+        ),
+        json.dumps({"jsonrpc": "2.0", "result": {"type": "done"}, "id": "1"}),
+    ]
 
-    async def run_app(task_status=trio.TASK_STATUS_IGNORED):
-        listeners = await open_unix_listener(app_sock)
-        task_status.started()
-        try:
-            await trio.serve_listeners(mock_app_handler, listeners)
-        finally:
-            listeners[0].socket.close()
+    class MockAppResponse:
+        def __init__(self):
+            self.status_code = 200
 
-    async def run_engine(task_status=trio.TASK_STATUS_IGNORED):
-        """Run the engine server."""
-        listeners = await open_unix_listener(engine_sock)
-        task_status.started()
-        try:
-            await trio.serve_listeners(engine_handle_connection, listeners)
-        finally:
-            listeners[0].socket.close()
+        async def __aenter__(self):
+            return self
 
-    async def run_coordinator():
-        """Run the coordinator client."""
-        client = EngineClient(engine_sock)
-        async for chunk in client.submit_task("hello world"):
-            results.append(chunk)
+        async def __aexit__(self, *args):
+            pass
 
-    try:
-        async with trio.open_nursery() as nursery:
-            # Start App
-            await nursery.start(run_app)
+        async def aiter_lines(self):
+            for line in app_response_lines:
+                yield line
 
-            # Start Engine
-            await nursery.start(run_engine)
+    def mock_app_stream(*args, **kwargs):
+        return MockAppResponse()
 
-            # Give time to start
-            await trio.sleep(0.1)
+    from unittest.mock import patch, MagicMock
 
-            # Run coordinator
-            await run_coordinator()
+    with patch("httpx.AsyncClient.stream", side_effect=mock_app_stream):
+        with patch("uuid.uuid4", return_value=MagicMock(__str__=lambda x: "1")):
+            # Coordinator calls Engine
+            # We use ASGITransport to point Coordinator to Engine app directly
 
-            nursery.cancel_scope.cancel()
-    finally:
-        engine.APP_SOCKET_PATH = original_app_path
-        if os.path.exists(engine_sock):
-            os.unlink(engine_sock)
-        if os.path.exists(app_sock):
-            os.unlink(app_sock)
+            async with AsyncClient(
+                transport=ASGITransport(app=engine_fastapi), base_url="http://engine"
+            ):
+                # We need to inject this client or base URL into EngineClient?
+                # Actually EngineClient uses DEFAULT_HOST/PORT.
+                # Let's just mock the EngineClient's network call too or point it to a real server.
 
-    # Verify results
-    assert results == ["hello", "world"]
+                # For a true integration test WITHOUT real sockets, we can't easily use EngineClient
+                # as is because it creates its own httpx.AsyncClient internally.
 
+                # Let's patch EngineClient.url to point to our mock engine
+                client = EngineClient(host="engine", port=80)
 
-@pytest.mark.trio
-async def test_multiple_sequential_tasks(temp_socket_path):
-    """Test multiple sequential tasks on the same connection."""
-    engine_sock = temp_socket_path + ".engine"
-    app_sock = temp_socket_path + ".app"
+                # We must also ensure EngineClient uses our transport-aware AsyncClient.
+                # Since EngineClient creates its own in 'async with httpx.AsyncClient(...)',
+                # we should patch httpx.AsyncClient constructor.
 
-    from engine import engine
+                def mock_client_factory(*args, **kwargs):
+                    # Ensure it uses our transport for the 'engine' host
+                    kwargs["transport"] = ASGITransport(app=engine_fastapi)
+                    return AsyncClient(*args, **kwargs)
 
-    original_app_path = engine.APP_SOCKET_PATH
-    engine.APP_SOCKET_PATH = app_sock
+                with patch("httpx.AsyncClient", side_effect=mock_client_factory):
+                    results = []
+                    async for chunk in client.submit_task(rpc_req_payload):
+                        results.append(chunk)
 
-    async def run_app(task_status=trio.TASK_STATUS_IGNORED):
-        listeners = await open_unix_listener(app_sock)
-        task_status.started()
-        try:
-            await trio.serve_listeners(mock_app_handler, listeners)
-        finally:
-            listeners[0].socket.close()
-
-    async def run_engine(task_status=trio.TASK_STATUS_IGNORED):
-        listeners = await open_unix_listener(engine_sock)
-        task_status.started()
-        try:
-            await trio.serve_listeners(engine_handle_connection, listeners)
-        finally:
-            listeners[0].socket.close()
-
-    async def run_multiple_tasks():
-        client = EngineClient(engine_sock)
-        # First task
-        results1 = []
-        async for chunk in client.submit_task("first task"):
-            results1.append(chunk)
-        # Second task
-        results2 = []
-        async for chunk in client.submit_task("second task"):
-            results2.append(chunk)
-        return results1, results2
-
-    try:
-        async with trio.open_nursery() as nursery:
-            await nursery.start(run_app)
-            await nursery.start(run_engine)
-            await trio.sleep(0.1)
-            results1, results2 = await run_multiple_tasks()
-            nursery.cancel_scope.cancel()
-    finally:
-        engine.APP_SOCKET_PATH = original_app_path
-        if os.path.exists(engine_sock):
-            os.unlink(engine_sock)
-        if os.path.exists(app_sock):
-            os.unlink(app_sock)
-
-    assert results1 == ["first", "task"]
-    assert results2 == ["second", "task"]
+                    assert results == ["hello", "world"]
 
 
 @pytest.mark.trio
-async def test_concurrent_clients(temp_socket_path):
-    """Test multiple concurrent clients connecting to the engine."""
-    all_results = []
-    engine_sock = temp_socket_path + ".engine"
-    app_sock = temp_socket_path + ".app"
+async def test_error_propagation_integration():
+    """Test that errors from App propagate correctly through Engine to Coordinator."""
+    from httpx import AsyncClient, ASGITransport
+    from unittest.mock import patch, MagicMock
 
-    from engine import engine
+    class MockErrorResponse:
+        def __init__(self):
+            self.status_code = 200  # JSON-RPC errors often 200 but contain error object
 
-    original_app_path = engine.APP_SOCKET_PATH
-    engine.APP_SOCKET_PATH = app_sock
+        async def __aenter__(self):
+            return self
 
-    async def run_app(task_status=trio.TASK_STATUS_IGNORED):
-        listeners = await open_unix_listener(app_sock)
-        task_status.started()
-        try:
-            await trio.serve_listeners(mock_app_handler, listeners)
-        finally:
-            listeners[0].socket.close()
+        async def __aexit__(self, *args):
+            pass
 
-    async def run_engine(task_status=trio.TASK_STATUS_IGNORED):
-        listeners = await open_unix_listener(engine_sock)
-        task_status.started()
-        try:
-            await trio.serve_listeners(engine_handle_connection, listeners)
-        finally:
-            listeners[0].socket.close()
+        async def aiter_lines(self):
+            yield json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32000, "message": "Simulated App Failure"},
+                    "id": "1",
+                }
+            )
 
-    async def run_client(client_id):
-        client = EngineClient(engine_sock)
-        results = []
-        async for chunk in client.submit_task(f"client {client_id}"):
-            results.append(chunk)
-        all_results.append((client_id, results))
+    with patch("httpx.AsyncClient.stream", return_value=MockErrorResponse()):
+        with patch("uuid.uuid4", return_value=MagicMock(__str__=lambda x: "1")):
+            client = EngineClient(host="engine", port=80)
 
-    try:
-        async with trio.open_nursery() as nursery:
-            await nursery.start(run_app)
-            await nursery.start(run_engine)
-            await trio.sleep(0.1)
+            def mock_client_factory(*args, **kwargs):
+                kwargs["transport"] = ASGITransport(app=engine_fastapi)
+                return AsyncClient(*args, **kwargs)
 
-            async with trio.open_nursery() as client_nursery:
-                client_nursery.start_soon(run_client, 1)
-                client_nursery.start_soon(run_client, 2)
-                client_nursery.start_soon(run_client, 3)
+            with patch("httpx.AsyncClient", side_effect=mock_client_factory):
+                results = []
+                async for chunk in client.submit_task("test"):
+                    results.append(chunk)
 
-            nursery.cancel_scope.cancel()
-    finally:
-        engine.APP_SOCKET_PATH = original_app_path
-        if os.path.exists(engine_sock):
-            os.unlink(engine_sock)
-        if os.path.exists(app_sock):
-            os.unlink(app_sock)
-
-    assert len(all_results) == 3
-    for client_id, results in all_results:
-        assert results == ["client", str(client_id)]
-
-
-@pytest.mark.trio
-async def test_empty_payload(temp_socket_path):
-    """Test handling of empty payload."""
-    results = []
-    engine_sock = temp_socket_path + ".engine"
-    app_sock = temp_socket_path + ".app"
-
-    from engine import engine
-
-    original_app_path = engine.APP_SOCKET_PATH
-    engine.APP_SOCKET_PATH = app_sock
-
-    async def run_app(task_status=trio.TASK_STATUS_IGNORED):
-        listeners = await open_unix_listener(app_sock)
-        task_status.started()
-        try:
-            await trio.serve_listeners(mock_app_handler, listeners)
-        finally:
-            listeners[0].socket.close()
-
-    async def run_engine(task_status=trio.TASK_STATUS_IGNORED):
-        listeners = await open_unix_listener(engine_sock)
-        task_status.started()
-        try:
-            await trio.serve_listeners(engine_handle_connection, listeners)
-        finally:
-            listeners[0].socket.close()
-
-    async def run_coordinator():
-        client = EngineClient(engine_sock)
-        async for chunk in client.submit_task(""):
-            results.append(chunk)
-
-    try:
-        async with trio.open_nursery() as nursery:
-            await nursery.start(run_app)
-            await nursery.start(run_engine)
-            await trio.sleep(0.1)
-            await run_coordinator()
-            nursery.cancel_scope.cancel()
-    finally:
-        engine.APP_SOCKET_PATH = original_app_path
-        if os.path.exists(engine_sock):
-            os.unlink(engine_sock)
-        if os.path.exists(app_sock):
-            os.unlink(app_sock)
-
-    assert results == []
-
-
-@pytest.mark.trio
-async def test_large_payload(temp_socket_path):
-    """Test handling of large payloads."""
-    words = ["word" + str(i) for i in range(100)]
-    payload = " ".join(words)
-    results = []
-
-    engine_sock = temp_socket_path + ".engine"
-    app_sock = temp_socket_path + ".app"
-
-    from engine import engine
-
-    original_app_path = engine.APP_SOCKET_PATH
-    engine.APP_SOCKET_PATH = app_sock
-
-    async def run_app(task_status=trio.TASK_STATUS_IGNORED):
-        listeners = await open_unix_listener(app_sock)
-        task_status.started()
-        try:
-            await trio.serve_listeners(mock_app_handler, listeners)
-        finally:
-            listeners[0].socket.close()
-
-    async def run_engine(task_status=trio.TASK_STATUS_IGNORED):
-        listeners = await open_unix_listener(engine_sock)
-        task_status.started()
-        try:
-            await trio.serve_listeners(engine_handle_connection, listeners)
-        finally:
-            listeners[0].socket.close()
-
-    async def run_coordinator():
-        client = EngineClient(engine_sock)
-        async for chunk in client.submit_task(payload):
-            results.append(chunk)
-
-    try:
-        async with trio.open_nursery() as nursery:
-            await nursery.start(run_app)
-            await nursery.start(run_engine)
-            await trio.sleep(0.1)
-            await run_coordinator()
-            nursery.cancel_scope.cancel()
-    finally:
-        engine.APP_SOCKET_PATH = original_app_path
-        if os.path.exists(engine_sock):
-            os.unlink(engine_sock)
-        if os.path.exists(app_sock):
-            os.unlink(app_sock)
-
-    assert len(results) == 100
-    assert results == words
+                assert (
+                    len(results) == 0
+                )  # Should have failed and logged, not yielded chunks

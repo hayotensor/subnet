@@ -1,8 +1,8 @@
 import json
 
 import pytest
-from app.handler import handle_generic_task
-from engine.protocol import TaskRequest
+from subnet_app.handler import handle_generic_task
+from subnet_engine.protocol import TaskRequest
 
 
 class MockModel:

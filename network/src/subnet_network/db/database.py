@@ -15,10 +15,9 @@ class RocksDB:
 
     SEPARATOR = ":"
 
-    def __init__(self, base_path: str | None = None, subnet_id: int = 1):
+    def __init__(self, base_path: str | None = None):
         assert base_path is not None, "Path must be specified"
         self.base_path = base_path
-        self.subnet_id = subnet_id
         self.db_path = f"{base_path}_store"
         self.store = Rdict(self.db_path)
 

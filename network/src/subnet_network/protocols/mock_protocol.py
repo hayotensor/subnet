@@ -16,7 +16,7 @@ from libp2p.tools.utils import (
 from multiaddr import (
     Multiaddr,
 )
-from subnet_engine.engine import EngineClient
+from subnet_engine.coordinator import EngineClient
 import varint
 
 from subnet_network.protocols.pb.mock_protocol_pb2 import (
@@ -162,18 +162,26 @@ class MockProtocol:
                 message = MockProtocolMessage()
                 message.ParseFromString(msg_bytes)
 
-                logger.debug(f"Received DHT message from {peer_id}, type: {message.type}")
+                logger.debug(f"Received message from {peer_id}, type: {message.type}")
 
                 # Handle message to the engine API
                 client = EngineClient()
-                async for chunk in client.submit_task("<payload here>"):
+
+                # Extract payload from the protobuf message
+                # Assuming the message has a 'payload' field
+                payload = message.payload if hasattr(message, "payload") else str(message)
+
+                # Submit task and stream responses back
+                async for chunk in client.submit_task(payload):
                     logger.info(f"chunk: {chunk}")
-                    await stream.write(chunk)
+                    # Encode the chunk as bytes before writing to stream
+                    response_data = str(chunk).encode("utf-8")
+                    await stream.write(response_data)
 
             except Exception as proto_err:
                 logger.warning(f"Failed to parse protobuf message: {proto_err}")
 
             await stream.close()
         except Exception as e:
-            logger.error(f"Error handling DHT stream: {e}")
+            logger.error(f"Error handling stream: {e}")
             await stream.close()

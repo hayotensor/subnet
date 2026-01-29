@@ -1,12 +1,11 @@
 import json
 import logging
-import random
 import time
 from typing import Any, List, Optional
 
 from libp2p.peer.id import ID as PeerID
 
-from hypertensor.chain_data import (
+from subnet_network.hypertensor.chain_data import (
     AllSubnetBootnodes,
     Attest,
     AttestEntry,
@@ -19,15 +18,15 @@ from hypertensor.chain_data import (
     SubnetNodeConsensusData,
     SubnetNodeInfo,
 )
-from hypertensor.chain_functions import (
+from subnet_network.hypertensor.chain_functions import (
     EpochData,
     OverwatchEpochData,
     SubnetNodeClass,
     subnet_node_class_to_enum,
 )
-from hypertensor.config import BLOCK_SECS, EPOCH_LENGTH
-from hypertensor.mock.mock_db import MockDatabase  # assume separate file
-from utils.crypto.store_key import get_peer_id
+from subnet_network.hypertensor.config import BLOCK_SECS, EPOCH_LENGTH
+from subnet_network.hypertensor.mock.mock_db import MockDatabase
+from subnet_network.utils.crypto.store_key import get_peer_id
 
 # Configure logging
 logging.basicConfig(

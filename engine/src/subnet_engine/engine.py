@@ -1,10 +1,13 @@
 import logging
 import os
+import configparser
+import json
 
-import trio
-
-from subnet_engine.coordinator import EngineClient
-from subnet_engine.framing import recv_msg, send_msg
+from starlette.applications import Starlette
+from starlette.responses import StreamingResponse, JSONResponse
+from starlette.routing import Route
+import uvicorn
+import httpx
 
 # Configure logging
 logging.basicConfig(
@@ -13,139 +16,131 @@ logging.basicConfig(
 )
 logger = logging.getLogger("engine")
 
-# Default configuration
-ENGINE_SOCKET_PATH = os.environ.get("ENGINE_SOCKET_PATH", "/tmp/engine.sock")
-APP_SOCKET_PATH = os.environ.get("APP_SOCKET_PATH", "/tmp/app.sock")
+
+def load_config():
+    config = configparser.ConfigParser()
+    config_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "config.ini"
+    )
+    config.read(config_path)
+    return config
 
 
-async def handle_connection(stream):
-    """Handle an incoming client connection (from Network)."""
-    client_id = stream.socket.getpeername() if hasattr(stream, "socket") else "unknown"
-    logger.info(f"New connection from {client_id}")
-    async with trio.open_nursery() as nursery:
-        while True:
-            try:
-                req = await recv_msg(stream)
-                if req is None:
-                    break
-                nursery.start_soon(handle_task, stream, req)
-            except trio.EndOfChannel:
-                logger.info(f"Connection closed by {client_id}")
-                break
-            except Exception as e:
-                logger.error(f"Error handling connection: {e}")
-                break
+config = load_config()
+ENGINE_HOST = config.get("engine", "host", fallback="127.0.0.1")
+ENGINE_PORT = config.getint("engine", "port", fallback=5000)
+ALLOWED_IPS = [
+    ip.strip()
+    for ip in config.get("engine", "allowed_ips", fallback="127.0.0.1").split(",")
+]
+
+APP_HOST = config.get("app", "host", fallback="127.0.0.1")
+APP_PORT = config.getint("app", "port", fallback=5001)
+APP_URL = f"http://{APP_HOST}:{APP_PORT}/jsonrpc"
 
 
-async def handle_task(stream, req):
-    """Proxy a single task request to the App."""
-    request_id = req.get("request_id")
-
-    if not request_id:
-        logger.warning("Received request without request_id")
-        return
-
-    logger.debug(f"Proxying task {request_id} to App")
-
-    # Connect to App
-    # In a production system, you might want a connection pool here.
-    app_client = EngineClient(socket_path=APP_SOCKET_PATH)
+async def jsonrpc_endpoint(request):
+    """Proxy JSON-RPC 2.0 requests to the App via HTTP."""
+    client_host = request.client.host if request.client else "127.0.0.1"
+    if client_host not in ALLOWED_IPS and client_host not in (
+        "127.0.0.1",
+        "localhost",
+        "testclient",
+    ):
+        logger.warning(f"Connection from disallowed IP: {client_host}")
+        return JSONResponse({"error": "Forbidden"}, status_code=403)
 
     try:
-        # We need to manually manage the connection because EngineClient.submit_task
-        # is a generator that expects us to drive it, but here we want to just
-        # forward the raw request dictionary or re-construct it.
-        # Actually, EngineClient.submit_task takes a payload string and wraps it.
-        # But we have a raw 'req' dict here.
+        rpc_req = await request.json()
+    except Exception:
+        return JSONResponse(
+            {
+                "jsonrpc": "2.0",
+                "error": {"code": -32700, "message": "Parse error"},
+                "id": None,
+            },
+            status_code=400,
+        )
 
-        # Let's use a lower-level approach or reusing EngineClient methods carefully.
-        # EngineClient.submit_task sends: {"request_id":..., "task_type":"generic", "payload":...}
-        # We generally want to forward the 'req' exactly as is?
-        # If 'req' comes from Network's EngineClient, it matches the format.
+    # Validate JSON-RPC 2.0
+    if rpc_req.get("jsonrpc") != "2.0":
+        return JSONResponse(
+            {
+                "jsonrpc": "2.0",
+                "error": {"code": -32600, "message": "Invalid Request"},
+                "id": rpc_req.get("id"),
+            },
+            status_code=400,
+        )
 
-        # Let's verify if we can just forward 'req' as is.
-        # EngineClient logic:
-        # await send_msg(stream, req)
-        # while True: msg = await recv_msg(stream); yield msg
+    method = rpc_req.get("method")
+    req_id = rpc_req.get("id")
 
-        await app_client.connect()
-        # We need to access the underlying stream to send the raw req dict
-        # EngineClient._stream is internal but we can use it or extend the class.
-        # For simplicity, let's just do manual forwarding here reusing framing.
+    if method != "submit_task":
+        return JSONResponse(
+            {
+                "jsonrpc": "2.0",
+                "error": {"code": -32601, "message": "Method not found"},
+                "id": req_id,
+            },
+            status_code=404,
+        )
 
-        app_stream = app_client._stream
-        await send_msg(app_stream, req)
+    logger.debug(f"Proxying task {req_id} to App at {APP_URL}")
 
-        while True:
-            msg = await recv_msg(app_stream)
-            if msg is None:
-                # App closed connection
-                break
-
-            # Forward response to Network
-            await send_msg(stream, msg)
-
-            if msg.get("type") in ("done", "error"):
-                break
-
-        logger.info(f"Task {request_id} proxy complete")
-
-    except Exception as e:
-        logger.error(f"Error proxying task {request_id}: {e}")
+    async def proxy_generator():
+        """Connect to App via HTTP and proxy the streaming response."""
         try:
-            await send_msg(
-                stream,
-                {
-                    "request_id": request_id,
-                    "type": "error",
-                    "message": f"Proxy Error: {str(e)}",
-                },
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("POST", APP_URL, json=rpc_req) as response:
+                    if response.status_code != 200:
+                        err_msg = await response.aread()
+                        yield (
+                            json.dumps(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "error": {
+                                        "code": -32000,
+                                        "message": f"App Error: {err_msg.decode()}",
+                                    },
+                                    "id": req_id,
+                                }
+                            )
+                            + "\n"
+                        )
+                        return
+
+                    async for line in response.aiter_lines():
+                        if line:
+                            yield line + "\n"
+        except Exception as e:
+            logger.error(f"Error proxying task {req_id}: {e}")
+            yield (
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32000, "message": f"Proxy Error: {str(e)}"},
+                        "id": req_id,
+                    }
+                )
+                + "\n"
             )
-        except Exception:
-            pass
-    finally:
-        # Close connection to app? EngineClient logic is persistent but here we made a new one.
-        # Ideally we close it.
-        if app_client._stream:
-            await app_client._stream.aclose()
+
+    return StreamingResponse(proxy_generator(), media_type="application/x-jsonlines")
 
 
-async def open_unix_listener(path):
-    """Create a high-level Unix socket listener."""
-    sock = trio.socket.socket(trio.socket.AF_UNIX, trio.socket.SOCK_STREAM)
-    await sock.bind(path)
-    sock.listen()
-    return [trio.SocketListener(sock)]
+routes = [
+    Route("/jsonrpc", jsonrpc_endpoint, methods=["POST"]),
+]
+
+app = Starlette(debug=True, routes=routes)
 
 
-async def main():
-    """Start the engine server."""
-    # Clean up previous socket
-    if os.path.exists(ENGINE_SOCKET_PATH):
-        try:
-            os.unlink(ENGINE_SOCKET_PATH)
-            logger.info(f"Cleaned up existing socket at {ENGINE_SOCKET_PATH}")
-        except OSError as e:
-            logger.error(f"Failed to unlink socket: {e}")
-            return
-
-    try:
-        listeners = await open_unix_listener(ENGINE_SOCKET_PATH)
-        logger.info(f"Engine listening on {ENGINE_SOCKET_PATH}")
-        await trio.serve_listeners(handle_connection, listeners)
-    except Exception as e:
-        logger.critical(f"Engine failed: {e}")
-    finally:
-        if os.path.exists(ENGINE_SOCKET_PATH):
-            try:
-                os.unlink(ENGINE_SOCKET_PATH)
-                logger.info(f"Cleaned up socket at {ENGINE_SOCKET_PATH}")
-            except OSError:
-                pass
+def main():
+    """Start the engine server with uvicorn."""
+    logger.info(f"Engine starting on {ENGINE_HOST}:{ENGINE_PORT}")
+    uvicorn.run(app, host=ENGINE_HOST, port=ENGINE_PORT, log_level="info")
 
 
 if __name__ == "__main__":
-    try:
-        trio.run(main)
-    except KeyboardInterrupt:
-        logger.info("Engine stopped by user")
+    main()

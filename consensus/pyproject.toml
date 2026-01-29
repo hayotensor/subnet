@@ -1,8 +1,9 @@
+
 [project]
-name = "subnet-engine"
+name = "subnet-consensus"
 version = "0.1.0"
 requires-python = ">=3.10, <4.0"
-description = "Core engine and coordination protocol"
+description = "Consensus logic for subnet"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -14,8 +15,7 @@ classifiers = [
 ]
 dependencies = [
     "trio",
-    "msgpack",
-    "httpx",
+    "subnet-network", # Depends on the engine package
 ]
 
 [project.optional-dependencies]
@@ -31,7 +31,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-packages = ["subnet_engine"]
+packages = ["subnet_consensus"]
 
 [tool.setuptools.package-data]
-subnet_engine = ["py.typed"]
+subnet_consensus = ["py.typed"]
