@@ -14,12 +14,17 @@ classifiers = [
 ]
 dependencies = [
     "trio",
-    "msgpack",
     "httpx",
+    "starlette",
+    "uvicorn",
+    "python-dotenv",
 ]
 
 [project.optional-dependencies]
 dev = [
+    "pytest",
+    "pytest-trio",
+    "pytest-mock",
     "wheel",
     "setuptools>=42",
     "ruff>=0.11.10",

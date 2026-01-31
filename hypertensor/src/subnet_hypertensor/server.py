@@ -9,15 +9,14 @@ from starlette.routing import Route
 import uvicorn
 
 from subnet_engine.protocol import TaskRequest
-from subnet_app.handler import handle_generic_task
-from subnet_app.model import MockLLM, ModelRegistry
+from subnet_hypertensor.handler import handle_generic_task
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
-logger = logging.getLogger("app.server")
+logger = logging.getLogger("hypertensor.server")
 
 
 def load_config():
@@ -31,16 +30,11 @@ def load_config():
 
 config = load_config()
 APP_HOST = config.get("app", "host", fallback="127.0.0.1")
-APP_PORT = config.getint("app", "port", fallback=5001)
+APP_PORT = config.getint("app", "port", fallback=5002)
 ALLOWED_IPS = [
     ip.strip()
     for ip in config.get("app", "allowed_ips", fallback="127.0.0.1").split(",")
 ]
-
-# In-memory model registry
-registry = ModelRegistry()
-registry.register("gpt2", MockLLM("gpt2"))
-registry.register("llama3", MockLLM("llama3"))
 
 
 async def jsonrpc_endpoint(request):
@@ -120,7 +114,7 @@ async def jsonrpc_endpoint(request):
             await send_chan.send(json.dumps(response) + "\n")
 
         async with anyio.create_task_group() as tg:
-            tg.start_soon(handle_generic_task, req, send_response_func, registry)
+            tg.start_soon(handle_generic_task, req, send_response_func)
 
             # Close the channel once the task is done
             # Note: handle_generic_task doesn't return until it completes its logic

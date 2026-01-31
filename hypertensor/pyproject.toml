@@ -1,6 +1,6 @@
 
 [project]
-name = "subnet-app"
+name = "subnet-hypertensor"
 version = "0.1.0"
 requires-python = ">=3.10, <4.0"
 description = "Business logic application"
@@ -38,7 +38,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-packages = ["subnet_app"]
+packages = ["subnet_hypertensor"]
 
 [tool.setuptools.package-data]
-subnet_app = ["py.typed"]
+subnet_hypertensor = ["py.typed"]
